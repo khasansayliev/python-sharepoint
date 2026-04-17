@@ -57,12 +57,9 @@ def save_to_blob(blob_name: str, data: Any) -> None:
 # ──────────────────────────────────────────────
 class SharePointRESTClient:
     """
-    SharePoint on-premise REST API client with NTLM auth.
-    Replaces the SOAP-based SharePointSite + SharePointList classes.
+    SharePoint on-premise REST API client using NTLM authentication.
+    Replaces the SOAP-based SharePointSite and SharePointList classes.
     """
-
-    # SharePoint REST API fieldlarni to'liq qaytarishi uchun
-    _EXPAND_THRESHOLD = 30  # expand qilinadigan max lookup field soni
 
     def __init__(
         self,
@@ -97,7 +94,7 @@ class SharePointRESTClient:
         })
 
     def _get(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """GET request, JSON response qaytaradi."""
+        """Send a GET request and return the parsed JSON response."""
         response = self._session.get(
             url,
             params=params,
@@ -110,7 +107,7 @@ class SharePointRESTClient:
 
     # ── Field metadata ────────────────────────
     def _get_list_fields(self, list_name: str) -> List[Dict]:
-        """List fieldlarini olish — lookup fieldlarni aniqlash uchun."""
+        """Fetch field definitions for a list to identify lookup and user fields."""
         url = (
             f"{self.site_url}/_api/web/lists/getbytitle('{list_name}')/fields"
             f"?$filter=Hidden eq false and ReadOnlyField eq false"
@@ -120,8 +117,8 @@ class SharePointRESTClient:
 
     def _build_select_expand(self, fields: List[Dict]):
         """
-        $select va $expand parametrlarini avtomatik quradi.
-        Lookup fieldlar uchun /Title expand qilinadi.
+        Build $select and $expand query parameters from field definitions.
+        Lookup and User fields are expanded to retrieve their Title subproperty.
         """
         select_parts = []
         expand_parts = []
@@ -134,11 +131,11 @@ class SharePointRESTClient:
                 continue
 
             if field_type in ("Lookup", "LookupMulti"):
-                # Lookup: TeamName -> TeamName/Title
+                # Expand lookup fields to get display value instead of raw ID
                 select_parts.append(f"{name}/Title")
                 expand_parts.append(name)
             elif field_type in ("User", "UserMulti"):
-                # User: AssignedTo -> AssignedTo/Title
+                # Expand user fields to get display name instead of claim token
                 select_parts.append(f"{name}/Title")
                 expand_parts.append(name)
             else:
@@ -150,28 +147,28 @@ class SharePointRESTClient:
     @staticmethod
     def _clean_value(value: Any, field_type: str) -> Any:
         """
-        REST API dan kelgan qiymatlarni Python tipiga o'giradi.
-        SOAP dagi _python_type() ning REST ekvivalenti.
+        Convert a raw REST API field value to a clean Python type.
+        Equivalent to the SOAP-based _python_type() method.
         """
         if value is None:
             return None
 
-        # Lookup / User — dict holida keladi: {"Title": "Engineering"}
+        # Lookup and User fields come as dicts: {"Title": "Engineering"}
         if field_type in ("Lookup", "User") and isinstance(value, dict):
             return value.get("Title", value)
 
-        # LookupMulti / UserMulti — list of dicts
+        # Multi-value Lookup and User fields come as list of dicts
         if field_type in ("LookupMulti", "UserMulti") and isinstance(value, list):
             return [v.get("Title", v) for v in value if isinstance(v, dict)]
 
-        # DateTime
+        # Parse ISO 8601 datetime strings
         if field_type == "DateTime" and isinstance(value, str):
             try:
                 return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
             except ValueError:
                 return value
 
-        # Boolean
+        # Convert boolean to human-readable string
         if field_type == "Boolean":
             if value is True:
                 return "Yes"
@@ -179,11 +176,11 @@ class SharePointRESTClient:
                 return "No"
             return value
 
-        # MultiChoice — ";#Alice;#Bob;#" formatidan list
+        # MultiChoice values arrive as ";#Alice;#Bob;#" — split into a list
         if field_type == "MultiChoice" and isinstance(value, str):
             return [v for v in value.split(";#") if v.strip()]
 
-        # Number / Currency
+        # Cast numeric fields to float
         if field_type in ("Number", "Currency") and value != "":
             try:
                 return float(value)
@@ -199,14 +196,14 @@ class SharePointRESTClient:
         row_limit: int = 0,
     ) -> List[Dict[str, Any]]:
         """
-        SharePoint list itemlarini REST API orqali oladi.
-        SOAP dagi get_list_items() ning to'liq ekvivalenti.
+        Retrieve all items from a SharePoint list via the REST API.
+        Drop-in replacement for the SOAP-based get_list_items() method.
 
-        - Lookup/User fieldlar avtomatik expand qilinadi
-        - Barcha field typelar tozalanadi
-        - Pagination avtomatik ishlaydi
+        - Lookup and User fields are automatically expanded
+        - All field types are converted to clean Python values
+        - Pagination is handled automatically (supports lists with 5000+ items)
         """
-        # 1. Field metadatasini olish
+        # Fetch field metadata to build select/expand and type map
         fields = self._get_list_fields(list_name)
         field_type_map = {
             f["EntityPropertyName"]: f["TypeAsString"]
@@ -214,10 +211,9 @@ class SharePointRESTClient:
             if f.get("EntityPropertyName")
         }
 
-        # 2. $select va $expand qurish
+        # Build OData query parameters
         select, expand = self._build_select_expand(fields)
 
-        # 3. Asosiy so'rov
         url = f"{self.site_url}/_api/web/lists/getbytitle('{list_name}')/items"
         params: Dict[str, Any] = {}
         if select:
@@ -227,30 +223,29 @@ class SharePointRESTClient:
         if row_limit:
             params["$top"] = row_limit
 
-        # 4. Pagination — SharePoint 5000 dan ko'p bo'lsa sahifalaydi
+        # Paginate through all results — SharePoint pages at 5000 items by default
         all_items = []
         next_url: Optional[str] = url
 
         while next_url:
-            if next_url == url:
-                data = self._get(next_url, params=params)
-            else:
-                data = self._get(next_url)  # next link o'z params ini o'z ichida saqlaydi
+            # First request uses explicit params; subsequent pages use the __next URL
+            data = self._get(next_url, params=params if next_url == url else None)
 
             d = data.get("d", {})
             results = d.get("results", [])
 
-            # 5. Har bir row ni tozalash
+            # Clean and collect each row
             for row in results:
                 cleaned: Dict[str, Any] = {}
                 for key, value in row.items():
-                    if key.startswith("__"):  # __metadata kabi ichki fieldlar
+                    if key.startswith("__"):
+                        # Skip internal OData metadata fields
                         continue
                     field_type = field_type_map.get(key, "Text")
                     cleaned[key] = self._clean_value(value, field_type)
                 all_items.append(cleaned)
 
-            # 6. Keyingi sahifa bor-yo'qligini tekshirish
+            # Follow the next page link if present
             next_url = d.get("__next")
 
         logger.info("%s: %d items fetched via REST", list_name, len(all_items))
@@ -261,6 +256,7 @@ class SharePointRESTClient:
 # Main pipeline
 # ──────────────────────────────────────────────
 def extract_and_load() -> None:
+    """Extract items from each configured SharePoint list and save to blob storage."""
     sharepoint_host = ''
     sharepoint_username = ''
     sharepoint_password = ''
