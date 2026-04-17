@@ -1,50 +1,25 @@
 import json
 import logging
 import re
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import requests
-from lxml import etree
 from requests_ntlm import HttpNtlmAuth
-from requests_toolbelt import SSLAdapter
 from urllib3.util.retry import Retry
 import urllib3
-
-from airflow.sdk import dag, task
-from airflow.providers.microsoft.azure.hooks.wasb import WasbHook
-from airflow.hooks.base import BaseHook
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
+LISTS: List[str] = ['Committee Members']
 
-LISTS: List[str] = []
-
-WASB_CONN_ID = "conn_wasb_localdatalake"
-SHAREPOINT_CONN_ID = "conn-ntlm-sharepoint-onprem"
-BLOB_CONTAINER = "lake"
 BLOB_BASE_PATH = "landing/sp/ucms/v1"
-
-# SharePoint XML namespaces
-NS_SOAPENV = "http://schemas.xmlsoap.org/soap/envelope/"
-NS_SHAREPOINT = "http://schemas.microsoft.com/sharepoint/soap/"
-NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
-NS_ROWSET = "#RowsetSchema"
-
 
 # ──────────────────────────────────────────────
 # Utility Functions
 # ──────────────────────────────────────────────
-def _post(session: requests.Session, url: str, **kwargs) -> requests.Response:
-    """POST request with logging."""
-    response = session.post(url, **kwargs)
-    logger.debug("POST %s -> %s", url, response.status_code)
-    response.raise_for_status()
-    return response
-
-
 def _serialize_datetime(obj: Any) -> str:
     """JSON serializer for datetime objects."""
     if isinstance(obj, datetime):
@@ -58,546 +33,272 @@ def _sanitize_name(name: str) -> str:
 
 
 def save_to_blob(blob_name: str, data: Any) -> None:
-    """Serialize data to JSON and upload to Azure Blob Storage."""
+    """Serialize data to JSON and save locally (Azure hook commented out)."""
     json_payload = json.dumps(
         data,
         ensure_ascii=False,
         indent=2,
         default=_serialize_datetime,
     )
-    hook = WasbHook(wasb_conn_id=WASB_CONN_ID)
-    hook.load_string(
-        container_name=BLOB_CONTAINER,
-        blob_name=blob_name,
-        string_data=json_payload,
-        overwrite=True,
-    )
-    logger.info("Uploaded %d chars to %s/%s", len(json_payload), BLOB_CONTAINER, blob_name)
+    with open("data.json", "w", encoding="UTF-8") as f:
+        f.write(json_payload)
+    # hook = WasbHook(wasb_conn_id=WASB_CONN_ID)
+    # hook.load_string(
+    #     container_name=BLOB_CONTAINER,
+    #     blob_name=blob_name,
+    #     string_data=json_payload,
+    #     overwrite=True,
+    # )
+    logger.info("Saved %d chars to %s", len(json_payload), blob_name)
 
 
 # ──────────────────────────────────────────────
-# SOAP Envelope Builder
+# SharePoint REST Client
 # ──────────────────────────────────────────────
-class SoapEnvelope:
-    """Builds a SOAP XML envelope for SharePoint web-service calls."""
+class SharePointRESTClient:
+    """
+    SharePoint on-premise REST API client with NTLM auth.
+    Replaces the SOAP-based SharePointSite + SharePointList classes.
+    """
 
-    XML_DECLARATION = b'<?xml version="1.0" encoding="utf-8"?>'
-
-    NSMAP = {
-        "SOAP-ENV": NS_SOAPENV,
-        "ns0": NS_SOAPENV,
-        "ns1": NS_SHAREPOINT,
-        "xsi": NS_XSI,
-    }
-
-    def __init__(self, command: str) -> None:
-        self.envelope = etree.Element(f"{{{NS_SOAPENV}}}Envelope", nsmap=self.NSMAP)
-        body = etree.SubElement(self.envelope, f"{{{NS_SOAPENV}}}Body")
-        self._command = etree.SubElement(body, f"{{{NS_SHAREPOINT}}}{command}")
-        self._batch: Optional[etree._Element] = None
-
-    # ── Parameter helpers ─────────────────────
-    def add_parameter(self, parameter: str, value: Optional[str] = None) -> None:
-        sub = etree.SubElement(self._command, f"{{{NS_SHAREPOINT}}}{parameter}")
-        if value is not None:
-            sub.text = value
-
-    def add_actions(self, data: List[Dict[str, str]], kind: str) -> None:
-        """Build <Batch> element for UpdateListItems."""
-        if self._batch is None:
-            updates = etree.SubElement(self._command, f"{{{NS_SHAREPOINT}}}updates")
-            self._batch = etree.SubElement(updates, "Batch", OnError="Return", ListVersion="1")
-
-        if kind == "Delete":
-            for index, _id in enumerate(data, 1):
-                method = etree.SubElement(self._batch, "Method", ID=str(index), Cmd=kind)
-                field = etree.SubElement(method, "Field", Name="ID")
-                field.text = str(_id)
-        else:
-            for index, row in enumerate(data, 1):
-                method = etree.SubElement(self._batch, "Method", ID=str(index), Cmd=kind)
-                for key, value in row.items():
-                    field = etree.SubElement(method, "Field", Name=key)
-                    field.text = str(value)
-
-    def add_view_fields(self, fields: List[str]) -> None:
-        view_fields_wrapper = etree.SubElement(
-            self._command, f"{{{NS_SHAREPOINT}}}viewFields", ViewFieldsOnly="true"
-        )
-        view_fields = etree.SubElement(view_fields_wrapper, "ViewFields")
-        for field in fields:
-            etree.SubElement(view_fields, "FieldRef", Name=field)
-
-    def add_query(self, pyquery: Dict) -> None:
-        query_wrapper = etree.SubElement(self._command, f"{{{NS_SHAREPOINT}}}query")
-        query = etree.SubElement(query_wrapper, "Query")
-
-        if "OrderBy" in pyquery:
-            order = etree.SubElement(query, "OrderBy")
-            for field in pyquery["OrderBy"]:
-                if isinstance(field, tuple):
-                    attrs = {"Name": field[0]}
-                    if field[1] == "DESCENDING":
-                        attrs["Ascending"] = "FALSE"
-                    etree.SubElement(order, "FieldRef", **attrs)
-                else:
-                    etree.SubElement(order, "FieldRef", Name=field)
-
-        if "GroupBy" in pyquery:
-            group = etree.SubElement(query, "GroupBy")
-            for field in pyquery["GroupBy"]:
-                etree.SubElement(group, "FieldRef", Name=field)
-
-        if "Where" in pyquery:
-            query.append(pyquery["Where"])
-
-    # ── Serialization ─────────────────────────
-    def to_bytes(self) -> bytes:
-        return self.XML_DECLARATION + etree.tostring(self.envelope)
-
-    def __repr__(self) -> str:
-        return self.to_bytes().decode("utf-8")
-
-    def __str__(self) -> str:
-        return (self.XML_DECLARATION + etree.tostring(self.envelope, pretty_print=True)).decode("utf-8")
-
-
-# ──────────────────────────────────────────────
-# SharePoint List
-# ──────────────────────────────────────────────
-class SharePointList:
-    """Represents a single SharePoint list and provides CRUD operations."""
-
-    DATE_PATTERN = re.compile(r"\d+-\d+-\d+ \d+:\d+:\d+")
-
-    def __init__(
-        self,
-        session: requests.Session,
-        list_name: str,
-        url_builder: Callable[[str], str],
-        verify_ssl: bool,
-        users: Optional[Dict],
-        huge_tree: bool,
-        timeout: Optional[int],
-        exclude_hidden_fields: bool = False,
-    ) -> None:
-        self._session = session
-        self.list_name = list_name
-        self._url = url_builder
-        self._verify_ssl = verify_ssl
-        self.users = users
-        self.huge_tree = huge_tree
-        self.timeout = timeout
-
-        # Metadata populated by _fetch_list_metadata()
-        self.fields: List[Dict[str, str]] = []
-        self.regional_settings: Dict[str, str] = {}
-        self.server_settings: Dict[str, str] = {}
-        self._fetch_list_metadata()
-
-        if exclude_hidden_fields:
-            self.fields = [f for f in self.fields if f.get("Hidden", "FALSE") == "FALSE"]
-
-        self._sp_cols = {f["Name"]: {"name": f["StaticName"], "type": f["Type"]} for f in self.fields}
-        self._disp_cols = {f["DisplayName"]: {"name": f["StaticName"], "type": f["Type"]} for f in self.fields}
-
-        # Allow Title to be used as a display column
-        if "Title" in self._sp_cols:
-            title_info = self._sp_cols["Title"]
-            self._disp_cols[title_info["name"]] = {"name": "Title", "type": title_info["type"]}
-
-        self.last_request: Optional[str] = None
-
-    # ── Private helpers ───────────────────────
-    def _headers(self, soapaction: str) -> Dict[str, str]:
-        return {
-            "Content-Type": "text/xml; charset=UTF-8",
-            "SOAPAction": f"{NS_SHAREPOINT}{soapaction}",
-        }
-
-    def _send_soap(self, action: str, soap: SoapEnvelope) -> etree._Element:
-        """Send a SOAP request, parse and return the XML envelope."""
-        self.last_request = str(soap)
-        response = _post(
-            self._session,
-            url=self._url("Lists"),
-            headers=self._headers(action),
-            data=soap.to_bytes(),
-            verify=self._verify_ssl,
-            timeout=self.timeout,
-        )
-        return etree.fromstring(
-            response.text.encode("utf-8"),
-            parser=etree.XMLParser(huge_tree=self.huge_tree, recover=True),
-        )
-
-    @staticmethod
-    def _parse_ows_row(row: etree._Element) -> Dict[str, str]:
-        """Parse a single <z:row> element, stripping 'ows_' prefix."""
-        return {key[4:]: value for key, value in row.items() if key.startswith("ows_")}
-
-    # ── Type conversion ───────────────────────
-    def _python_type(self, key: str, value: Any) -> Any:
-        """Convert SharePoint internal value to Python type."""
-        try:
-            field_type = self._sp_cols[key]["type"]
-
-            if field_type in ("Number", "Currency"):
-                return float(value)
-
-            elif field_type == "DateTime":
-                match = self.DATE_PATTERN.search(value)
-                if match:
-                    value = match.group(0)
-                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-
-            elif field_type == "Boolean":
-                return {"1": "Yes", "0": "No"}.get(value, "")
-
-            elif field_type in ("User", "UserMulti"):
-                if self.users and value in self.users["sp"]:
-                    return self.users["sp"][value]
-                elif "#" in value:
-                    parts = value.split(";#")
-                    users = []
-                    for i in range(0, len(parts) - 1, 2):
-                        users.append(f"#{parts[i]};#{parts[i + 1]}")
-                    return users
-                return value
-
-            return value
-        except (AttributeError, ValueError):
-            return value
-
-    def _sp_type(self, key: str, value: Any) -> Any:
-        """Convert Python value to SharePoint internal type."""
-        try:
-            field_type = self._disp_cols[key]["type"]
-
-            if field_type in ("Number", "Currency"):
-                return value
-            elif field_type == "DateTime":
-                return value.strftime("%Y-%m-%d %H:%M:%S")
-            elif field_type == "Boolean":
-                if value == "Yes":
-                    return "1"
-                elif value == "No":
-                    return "0"
-                raise ValueError(f"{value} is not a valid Boolean — expected 'Yes' or 'No'")
-            elif self.users and field_type == "User":
-                return self.users["py"][key]
-            return value
-        except AttributeError:
-            return value
-
-    def _convert_to_internal(self, data: List[Dict]) -> List[Dict]:
-        """Convert display column names → internal SharePoint column names."""
-        new_data = []
-        for row in data:
-            new_row = {}
-            for key, value in row.items():
-                if key not in self._disp_cols:
-                    raise KeyError(f"'{key}' is not a column in list '{self.list_name}'")
-                new_row[self._disp_cols[key]["name"]] = self._sp_type(key, value)
-            new_data.append(new_row)
-        return new_data
-
-    def _convert_to_display(self, data: List[Dict]) -> None:
-        """In-place conversion: internal column names → display names."""
-        for row in data:
-            for key in list(row.keys()):
-                if key not in self._sp_cols:
-                    continue  # skip unknown columns gracefully
-                row[self._sp_cols[key]["name"]] = self._python_type(key, row.pop(key))
-
-    # ── Metadata ──────────────────────────────
-    @staticmethod
-    def _parse_list_envelope(
-        envelope: etree._Element,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
-        """Extract fields, regional settings, and server settings from GetList response."""
-        ns = {"re": "http://exslt.org/regular-expressions"}
-        _list = envelope[0][0][0][0]
-
-        fields = [
-            dict(row.items())
-            for row in _list.xpath("//*[re:test(local-name(), '.*Fields.*')]", namespaces=ns)[0]
-        ]
-        regional_settings = {
-            el.tag.strip(f"{{{NS_SHAREPOINT}}}"): el.text
-            for el in _list.xpath("//*[re:test(local-name(), '.*RegionalSettings.*')]", namespaces=ns)[0]
-        }
-        server_settings = {
-            el.tag.strip(f"{{{NS_SHAREPOINT}}}"): el.text
-            for el in _list.xpath("//*[re:test(local-name(), '.*ServerSettings.*')]", namespaces=ns)[0]
-        }
-        return fields, regional_settings, server_settings
-
-    def _fetch_list_metadata(self) -> None:
-        """Fetch and store list schema (fields, regional/server settings)."""
-        soap = SoapEnvelope("GetList")
-        soap.add_parameter("listName", self.list_name)
-        envelope = self._send_soap("GetList", soap)
-
-        fields, regional, server = self._parse_list_envelope(envelope)
-        self.fields.extend(fields)
-        self.regional_settings.update(regional)
-        self.server_settings.update(server)
-
-    # ── Public API ────────────────────────────
-    def get_list_items(self, row_limit: int = 0) -> List[Dict[str, Any]]:
-        """Fetch all items from the SharePoint list."""
-        soap = SoapEnvelope("GetListItems")
-        soap.add_parameter("listName", self.list_name)
-        soap.add_parameter("rowLimit", str(row_limit))
-
-        envelope = self._send_soap("GetListItems", soap)
-        listitems = envelope[0][0][0][0][0]
-
-        data = [self._parse_ows_row(row) for row in listitems]
-        self._convert_to_display(data)
-        return data
-
-
-# ──────────────────────────────────────────────
-# SharePoint Site
-# ──────────────────────────────────────────────
-class SharePointSite:
-    """Connects to a SharePoint site and provides access to lists and user info."""
-
-    SERVICES = {
-        "Alerts": "/_vti_bin/Alerts.asmx",
-        "Authentication": "/_vti_bin/Authentication.asmx",
-        "Copy": "/_vti_bin/Copy.asmx",
-        "Dws": "/_vti_bin/Dws.asmx",
-        "Forms": "/_vti_bin/Forms.asmx",
-        "Imaging": "/_vti_bin/Imaging.asmx",
-        "DspSts": "/_vti_bin/DspSts.asmx",
-        "Lists": "/_vti_bin/lists.asmx",
-        "Meetings": "/_vti_bin/Meetings.asmx",
-        "People": "/_vti_bin/People.asmx",
-        "Permissions": "/_vti_bin/Permissions.asmx",
-        "SiteData": "/_vti_bin/SiteData.asmx",
-        "Sites": "/_vti_bin/Sites.asmx",
-        "Search": "/_vti_bin/Search.asmx",
-        "UserGroup": "/_vti_bin/usergroup.asmx",
-        "Versions": "/_vti_bin/Versions.asmx",
-        "Views": "/_vti_bin/Views.asmx",
-        "WebPartPages": "/_vti_bin/WebPartPages.asmx",
-        "Webs": "/_vti_bin/Webs.asmx",
-    }
-
-    # Known fallback keys for user display name
-    _USER_NAME_KEYS = ("ImnName", "Name", "Title", "UserName")
+    # SharePoint REST API fieldlarni to'liq qaytarishi uchun
+    _EXPAND_THRESHOLD = 30  # expand qilinadigan max lookup field soni
 
     def __init__(
         self,
         site_url: str,
-        auth: Optional[Any] = None,
-        authcookie: Optional[requests.cookies.RequestsCookieJar] = None,
-        verify_ssl: bool = True,
-        ssl_version: Optional[float] = None,
-        huge_tree: bool = False,
-        timeout: Optional[int] = None,
+        username: str,
+        password: str,
+        verify_ssl: bool = False,
+        timeout: Optional[int] = 30,
         retry: Optional[Retry] = None,
     ) -> None:
-        self.site_url = site_url
+        self.site_url = site_url.rstrip("/")
         self._verify_ssl = verify_ssl
-        self.huge_tree = huge_tree
         self.timeout = timeout
-        self.last_request: Optional[str] = None
 
-        # Session with retry
         if retry is None:
             retry = Retry(
-                total=5, read=5, connect=5,
+                total=5,
+                read=5,
+                connect=5,
                 backoff_factor=0.3,
                 status_forcelist=[500, 502, 503, 504],
             )
 
         self._session = requests.Session()
-        http_adapter = requests.adapters.HTTPAdapter(max_retries=retry)
-        https_adapter = SSLAdapter(ssl_version, max_retries=retry) if ssl_version else http_adapter
+        adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.auth = HttpNtlmAuth(username, password)
+        self._session.headers.update({
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
+        })
 
-        self._session.mount("https://", https_adapter)
-        self._session.mount("http://", http_adapter)
+    def _get(self, url: str, params: Optional[Dict] = None) -> Dict:
+        """GET request, JSON response qaytaradi."""
+        response = self._session.get(
+            url,
+            params=params,
+            verify=self._verify_ssl,
+            timeout=self.timeout,
+        )
+        logger.debug("GET %s -> %s", url, response.status_code)
+        response.raise_for_status()
+        return response.json()
 
-        if authcookie is not None:
-            self._session.cookies = authcookie
-        else:
-            self._session.auth = auth
+    # ── Field metadata ────────────────────────
+    def _get_list_fields(self, list_name: str) -> List[Dict]:
+        """List fieldlarini olish — lookup fieldlarni aniqlash uchun."""
+        url = (
+            f"{self.site_url}/_api/web/lists/getbytitle('{list_name}')/fields"
+            f"?$filter=Hidden eq false and ReadOnlyField eq false"
+        )
+        data = self._get(url)
+        return data.get("d", {}).get("results", [])
 
-        # Bootstrap
-        self.site_info = self._fetch_site_info()
-        self.users = self._fetch_users()
+    def _build_select_expand(self, fields: List[Dict]):
+        """
+        $select va $expand parametrlarini avtomatik quradi.
+        Lookup fieldlar uchun /Title expand qilinadi.
+        """
+        select_parts = []
+        expand_parts = []
 
-    # ── Private helpers ───────────────────────
-    def _url(self, service: str) -> str:
-        return f"{self.site_url}{self.SERVICES[service]}"
+        for field in fields:
+            name = field.get("EntityPropertyName", "")
+            field_type = field.get("TypeAsString", "")
 
-    def _headers(self, soap_action: str) -> Dict[str, str]:
-        return {
-            "Content-Type": "text/xml; charset=UTF-8",
-            "SOAPAction": f"{NS_SHAREPOINT}{soap_action}",
+            if not name:
+                continue
+
+            if field_type in ("Lookup", "LookupMulti"):
+                # Lookup: TeamName -> TeamName/Title
+                select_parts.append(f"{name}/Title")
+                expand_parts.append(name)
+            elif field_type in ("User", "UserMulti"):
+                # User: AssignedTo -> AssignedTo/Title
+                select_parts.append(f"{name}/Title")
+                expand_parts.append(name)
+            else:
+                select_parts.append(name)
+
+        return ",".join(select_parts), ",".join(expand_parts)
+
+    # ── Value cleaning ────────────────────────
+    @staticmethod
+    def _clean_value(value: Any, field_type: str) -> Any:
+        """
+        REST API dan kelgan qiymatlarni Python tipiga o'giradi.
+        SOAP dagi _python_type() ning REST ekvivalenti.
+        """
+        if value is None:
+            return None
+
+        # Lookup / User — dict holida keladi: {"Title": "Engineering"}
+        if field_type in ("Lookup", "User") and isinstance(value, dict):
+            return value.get("Title", value)
+
+        # LookupMulti / UserMulti — list of dicts
+        if field_type in ("LookupMulti", "UserMulti") and isinstance(value, list):
+            return [v.get("Title", v) for v in value if isinstance(v, dict)]
+
+        # DateTime
+        if field_type == "DateTime" and isinstance(value, str):
+            try:
+                return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                return value
+
+        # Boolean
+        if field_type == "Boolean":
+            if value is True:
+                return "Yes"
+            if value is False:
+                return "No"
+            return value
+
+        # MultiChoice — ";#Alice;#Bob;#" formatidan list
+        if field_type == "MultiChoice" and isinstance(value, str):
+            return [v for v in value.split(";#") if v.strip()]
+
+        # Number / Currency
+        if field_type in ("Number", "Currency") and value != "":
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return value
+
+        return value
+
+    # ── Main public method ────────────────────
+    def get_list_items(
+        self,
+        list_name: str,
+        row_limit: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        SharePoint list itemlarini REST API orqali oladi.
+        SOAP dagi get_list_items() ning to'liq ekvivalenti.
+
+        - Lookup/User fieldlar avtomatik expand qilinadi
+        - Barcha field typelar tozalanadi
+        - Pagination avtomatik ishlaydi
+        """
+        # 1. Field metadatasini olish
+        fields = self._get_list_fields(list_name)
+        field_type_map = {
+            f["EntityPropertyName"]: f["TypeAsString"]
+            for f in fields
+            if f.get("EntityPropertyName")
         }
 
-    def _fetch_site_info(self) -> str:
-        soap = SoapEnvelope("GetSite")
-        soap.add_parameter("SiteUrl", self.site_url)
-        self.last_request = str(soap)
+        # 2. $select va $expand qurish
+        select, expand = self._build_select_expand(fields)
 
-        response = _post(
-            self._session,
-            url=self._url("Sites"),
-            headers=self._headers("GetSite"),
-            data=soap.to_bytes(),
-            verify=self._verify_ssl,
-            timeout=self.timeout,
-        )
-        envelope = etree.fromstring(
-            response.text.encode("utf-8"),
-            parser=etree.XMLParser(huge_tree=self.huge_tree, recover=True),
-        )
-        return envelope[0][0][0].text
+        # 3. Asosiy so'rov
+        url = f"{self.site_url}/_api/web/lists/getbytitle('{list_name}')/items"
+        params: Dict[str, Any] = {}
+        if select:
+            params["$select"] = select
+        if expand:
+            params["$expand"] = expand
+        if row_limit:
+            params["$top"] = row_limit
 
-    def _fetch_users(self, rowlimit: int = 0) -> Optional[Dict[str, Dict[str, str]]]:
-        """Fetch UserInfo list and build bidirectional lookup maps.
+        # 4. Pagination — SharePoint 5000 dan ko'p bo'lsa sahifalaydi
+        all_items = []
+        next_url: Optional[str] = url
 
-        Handles missing 'ImnName' by falling back to 'Name', 'Title', etc.
-        This is the fix for the KeyError that occurs in Airflow where the
-        SharePoint SOAP response may not include 'ImnName' depending on
-        the service account's permissions and SharePoint version.
-        """
-        soap = SoapEnvelope("GetListItems")
-        soap.add_parameter("listName", "UserInfo")
-        soap.add_parameter("rowLimit", str(rowlimit))
-        self.last_request = str(soap)
+        while next_url:
+            if next_url == url:
+                data = self._get(next_url, params=params)
+            else:
+                data = self._get(next_url)  # next link o'z params ini o'z ichida saqlaydi
 
-        response = _post(
-            self._session,
-            url=self._url("Lists"),
-            headers=self._headers("GetListItems"),
-            data=soap.to_bytes(),
-            verify=self._verify_ssl,
-            timeout=self.timeout,
-        )
+            d = data.get("d", {})
+            results = d.get("results", [])
 
+            # 5. Har bir row ni tozalash
+            for row in results:
+                cleaned: Dict[str, Any] = {}
+                for key, value in row.items():
+                    if key.startswith("__"):  # __metadata kabi ichki fieldlar
+                        continue
+                    field_type = field_type_map.get(key, "Text")
+                    cleaned[key] = self._clean_value(value, field_type)
+                all_items.append(cleaned)
+
+            # 6. Keyingi sahifa bor-yo'qligini tekshirish
+            next_url = d.get("__next")
+
+        logger.info("%s: %d items fetched via REST", list_name, len(all_items))
+        return all_items
+
+
+# ──────────────────────────────────────────────
+# Main pipeline
+# ──────────────────────────────────────────────
+def extract_and_load() -> None:
+    sharepoint_host = ''
+    sharepoint_username = ''
+    sharepoint_password = ''
+
+    if not sharepoint_host.endswith("/apps/ucms"):
+        sharepoint_host = f"{sharepoint_host}/apps/ucms"
+
+    client = SharePointRESTClient(
+        site_url=sharepoint_host,
+        username=sharepoint_username,
+        password=sharepoint_password,
+        verify_ssl=False,
+    )
+
+    if not LISTS:
+        logger.warning("LISTS is empty — nothing to extract.")
+        return
+
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d%H%M%S")
+    date_parts = f"{now:%Y}/{now:%m}/{now:%d}"
+
+    for list_title in LISTS:
         try:
-            envelope = etree.fromstring(
-                response.text.encode("utf-8"),
-                parser=etree.XMLParser(huge_tree=self.huge_tree, recover=True),
-            )
-        except Exception as exc:
-            raise requests.ConnectionError(
-                f"GetUsers response failed to parse: {exc}"
-            ) from exc
+            items = client.get_list_items(list_title)
+            logger.info("%s: %d items fetched", list_title, len(items))
 
-        listitems = envelope[0][0][0][0][0]
-
-        data = []
-        for row in listitems:
-            data.append({key[4:]: value for key, value in row.items() if key.startswith("ows_")})
-
-        if data:
-            logger.debug("User row sample keys: %s", list(data[0].keys()))
-
-        # Build lookup maps with fallback for user display name
-        user_map_py: Dict[str, str] = {}
-        user_map_sp: Dict[str, str] = {}
-        for user_row in data:
-            user_id = user_row.get("ID")
-            if not user_id:
+            if not items:
                 continue
 
-            # Try known name keys in priority order
-            user_name = None
-            for key in self._USER_NAME_KEYS:
-                if key in user_row and user_row[key]:
-                    user_name = user_row[key]
-                    break
+            safe_name = _sanitize_name(list_title)
+            blob_path = f"{BLOB_BASE_PATH}/{safe_name}/{date_parts}/{safe_name}_{timestamp}.json"
+            save_to_blob(blob_path, items)
 
-            if not user_name:
-                logger.warning("User ID=%s has no recognizable name field, skipping. Keys: %s",
-                               user_id, list(user_row.keys()))
-                continue
-
-            sp_key = f"{user_id};#{user_name}"
-            user_map_py[user_name] = sp_key
-            user_map_sp[sp_key] = user_name
-
-        logger.info("Loaded %d users from SharePoint UserInfo list", len(user_map_py))
-        return {"py": user_map_py, "sp": user_map_sp}
-
-    # ── Public API ────────────────────────────
-    def get_list(self, list_name: str, exclude_hidden_fields: bool = False) -> SharePointList:
-        """Return a SharePointList object for the given list name."""
-        return SharePointList(
-            self._session,
-            list_name,
-            self._url,
-            self._verify_ssl,
-            self.users,
-            self.huge_tree,
-            self.timeout,
-            exclude_hidden_fields=exclude_hidden_fields,
-        )
+        except Exception:
+            logger.exception("Failed to extract list '%s'", list_title)
+            raise
 
 
-# ──────────────────────────────────────────────
-# Airflow DAG
-# ──────────────────────────────────────────────
-@dag(
-    dag_id="sharepoint_to_azure_blob_pipeline",
-    default_args={
-        "owner": "data_engineering",
-        "depends_on_past": False,
-        "retries": 2,
-        "retry_delay": timedelta(minutes=2),
-    },
-    schedule="@daily",
-    start_date=datetime(2026, 3, 1),
-    catchup=False,
-    tags=["sharepoint", "azure_blob"],
-)
-def sharepoint_extraction_dag():
-
-    @task()
-    def extract_and_load() -> None:
-        conn = BaseHook.get_connection(SHAREPOINT_CONN_ID)
-
-        site = SharePointSite(
-            conn.host,
-            auth=HttpNtlmAuth(conn.login, conn.password),
-            verify_ssl=False,
-        )
-
-        if not LISTS:
-            logger.warning("LISTS is empty — nothing to extract.")
-            return
-
-        now = datetime.now()
-        timestamp = now.strftime("%Y%m%d%H%M%S")
-        date_parts = f"{now:%Y}/{now:%m}/{now:%d}"
-
-        for list_title in LISTS:
-            try:
-                sp_list = site.get_list(list_title)
-                items = sp_list.get_list_items()
-
-                logger.info("%s: %d items fetched", list_title, len(items))
-
-                if not items:
-                    continue
-
-                safe_name = _sanitize_name(list_title)
-                blob_path = f"{BLOB_BASE_PATH}/{safe_name}/{date_parts}/{safe_name}_{timestamp}.json"
-                save_to_blob(blob_path, items)
-
-            except Exception:
-                logger.exception("Failed to extract list '%s'", list_title)
-                raise
-
+if __name__ == "__main__":
     extract_and_load()
-
-
-sharepoint_dag = sharepoint_extraction_dag()
