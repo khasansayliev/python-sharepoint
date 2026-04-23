@@ -367,12 +367,34 @@ class SharePointList:
         return new_data
 
     def _convert_to_display(self, data: List[Dict]) -> None:
-        """In-place conversion: internal column names → display names."""
+        """In-place conversion: internal column names → display names.
+
+        For known columns (_sp_cols), full type conversion is applied.
+        For unknown/system columns (Author, Editor, Category, etc.) that
+        SharePoint does not include in the list schema, a universal
+        id;#value cleanup is applied so raw SharePoint tokens never leak
+        into the output JSON.
+        """
         for row in data:
             for key in list(row.keys()):
-                if key not in self._sp_cols:
-                    continue
-                row[self._sp_cols[key]["name"]] = self._python_type(key, row.pop(key))
+                if key in self._sp_cols:
+                    # Known column — full type-aware conversion
+                    row[self._sp_cols[key]["name"]] = self._python_type(key, row.pop(key))
+                else:
+                    # Unknown/system column (Author, Editor, Category, etc.)
+                    # Apply universal id;# cleanup and HTML stripping
+                    raw = row[key]
+                    if raw is None or str(raw).strip() == "":
+                        row[key] = None
+                    else:
+                        val = str(raw)
+                        # Strip HTML tags first (covers Note-like system fields)
+                        val = self.HTML_TAG_PATTERN.sub("", val).strip()
+                        if not val:
+                            row[key] = None
+                        else:
+                            # Strip id;# prefix for User/Lookup-like system fields
+                            row[key] = self._strip_id_hash(val)
 
     # ── Metadata ──────────────────────────────
     @staticmethod
