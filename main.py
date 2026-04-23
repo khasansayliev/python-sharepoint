@@ -253,7 +253,22 @@ class SharePointList:
             return None
 
         try:
-            field_type = self._sp_cols[key]["type"]
+            field_type = self._sp_cols.get(key, {}).get("type")
+
+            # ── Note: strip HTML first (before any other logic) ──────────────
+            if field_type == "Note":
+                clean = self.HTML_TAG_PATTERN.sub("", value).strip()
+                return clean if clean else None
+
+            # ── Universal id;#value pre-strip ────────────────────────────────
+            # SharePoint encodes many field types as "id;#actual_value".
+            # Strip this prefix BEFORE type-specific conversion so that
+            # Number("116;#6300") → float(6300), DateTime("116;#2021-...") → datetime, etc.
+            if ";#" in str(value):
+                stripped = self._strip_id_hash(str(value))
+                if stripped is None:
+                    return None
+                value = stripped
 
             # Numeric fields
             if field_type in ("Number", "Currency"):
@@ -272,64 +287,50 @@ class SharePointList:
 
             # User and UserMulti fields
             elif field_type in ("User", "UserMulti"):
-                if self.users and value in self.users["sp"]:
-                    return self.users["sp"][value]
-                elif ";#" in value:
-                    parts = value.split(";#")
-                    users = [parts[i] for i in range(1, len(parts), 2) if parts[i].strip()]
-                    return users if len(users) > 1 else users[0] if users else None
-                return value if value.strip() else None
+                # After id;# strip, value is already the display name
+                return value.strip() if value.strip() else None
 
-            # Lookup and LookupMulti fields — strip leading "id;#" prefix
+            # Lookup and LookupMulti fields
             elif field_type in ("Lookup", "LookupMulti"):
-                if ";#" not in value:
-                    return value.strip() if value.strip() else None
-                parts = value.split(";#")
-                names = [parts[i] for i in range(1, len(parts), 2) if parts[i].strip()]
-                # e.g. "116;#" → parts = ["116", ""] → names = [] → None
-                if not names:
-                    return None
-                return names if len(names) > 1 else names[0]
+                # After id;# strip, value is already the display name
+                # Handle multi-value: "Name1;#Name2" (no numeric prefix now)
+                if ";#" in value:
+                    names = [v for v in value.split(";#") if v.strip()]
+                    return names if len(names) > 1 else names[0] if names else None
+                return value.strip() if value.strip() else None
 
             # MultiChoice fields — ";#Alice;#Bob;#" -> ["Alice", "Bob"]
             elif field_type == "MultiChoice":
                 values = [v for v in value.split(";#") if v.strip()]
                 return values if values else None
 
-            # Note (rich text / multiline) — strip HTML tags, NOT split on ";#"
-            # "<div></div>" → None, "<div>Some text</div>" → "Some text"
-            elif field_type == "Note":
-                clean = self.HTML_TAG_PATTERN.sub("", value).strip()
-                return clean if clean else None
-
-            # Calculated fields — "resulttype;#actualvalue"
+            # Calculated fields — after strip, value is already the actual value
             elif field_type == "Calculated":
-                if ";#" not in value:
-                    return value
-                result_type, result_value = value.split(";#", 1)
-                result_type = result_type.lower()
-                if not result_value.strip():
-                    return None
-                if result_type == "float":
-                    return float(result_value)
-                elif result_type == "datetime":
-                    match = self.DATE_PATTERN.search(result_value)
-                    if match:
-                        result_value = match.group(0)
-                    return datetime.strptime(result_value, "%Y-%m-%d %H:%M:%S")
-                elif result_type == "boolean":
-                    return {"1": "Yes", "0": "No"}.get(result_value, None)
-                else:
-                    return result_value
+                # id;# already stripped above; value may still be "type;#val" format
+                # if the Calculated result_type was in the first segment
+                if ";#" in value:
+                    result_type, result_value = value.split(";#", 1)
+                    result_type = result_type.lower()
+                    if not result_value.strip():
+                        return None
+                    if result_type == "float":
+                        return float(result_value)
+                    elif result_type == "datetime":
+                        match = self.DATE_PATTERN.search(result_value)
+                        if match:
+                            result_value = match.group(0)
+                        return datetime.strptime(result_value, "%Y-%m-%d %H:%M:%S")
+                    elif result_type == "boolean":
+                        return {"1": "Yes", "0": "No"}.get(result_value, None)
+                    else:
+                        return result_value
+                return value.strip() if value.strip() else None
 
-            # ── Universal fallback for ALL other field types ──────────────────
-            # (Text, Choice, URL, Counter, Integer, Attachments, etc.)
-            # If SharePoint somehow left an "id;#value" pattern, strip it.
-            cleaned = self._strip_id_hash(str(value))
-            return cleaned if cleaned else None
+            # ── Universal fallback (Text, Choice, URL, Counter, Integer, etc.)
+            return value.strip() if value.strip() else None
 
-        except (AttributeError, ValueError):
-            # If conversion failed but value contains id;#, still clean it up.
+        except (AttributeError, ValueError, KeyError):
+            # Last-resort: strip id;# and return
             cleaned = self._strip_id_hash(str(value))
             return cleaned if cleaned else None
 
@@ -377,13 +378,17 @@ class SharePointList:
         """
         for row in data:
             for key in list(row.keys()):
+                raw_val = row[key]
                 if key in self._sp_cols:
                     # Known column — full type-aware conversion
-                    row[self._sp_cols[key]["name"]] = self._python_type(key, row.pop(key))
+                    converted = self._python_type(key, raw_val)
+                    new_key = self._sp_cols[key]["name"]
+                    row.pop(key)
+                    row[new_key] = converted
                 else:
                     # Unknown/system column (Author, Editor, Category, etc.)
                     # Apply universal id;# cleanup and HTML stripping
-                    raw = row[key]
+                    raw = raw_val
                     if raw is None or str(raw).strip() == "":
                         row[key] = None
                     else:
